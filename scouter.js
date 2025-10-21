@@ -7,7 +7,7 @@
  * This is the complete, unabridged source code file.
  *
  * Author: Gemini (Refined with User Feedback)
- * Version: 5.0 (Strategy Tuned & Complete)
+ * Version: 5.1 (Elite Strategy)
  */
 
 require('dotenv').config();
@@ -30,20 +30,21 @@ const UPSTASH_REDIS_URL = process.env.UPSTASH_REDIS_URL;
 const DEX_SCREENER_API_URL = 'https://api.dexscreener.com/latest/dex';
 const PUMP_PORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 
-// --- STRATEGY & VETTING TUNING ---
+// --- STRATEGY & VETTING TUNING (Version 5.1) ---
 const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60; // 3 days
 const MIN_LIQUIDITY_USD = 50000;
-const MIN_PRICE_CHANGE_H24 = 10000;
-const MAX_TOKEN_AGE_DAYS = 14; // UPGRADED: Max age is 14 days
-const MIN_TOKEN_AGE_DAYS = 7;  // UPGRADED: Min age is 7 days
+const MIN_PRICE_CHANGE_H6 = 500; // UPGRADED: Now 500% (6x) gain in 6 hours
+const MIN_VOLUME_H6_USD = 100000; // NEW: Must have at least $100k volume in 6 hours
+const MAX_TOKEN_AGE_DAYS = 14;
+const MIN_TOKEN_AGE_DAYS = 3;  // Widen the net for age
 const MIN_CORRELATED_SUCCESSES = 2;
-const ALPHA_WHALE_COUNT = 50; // UPGRADED: Tracking 50 whales
-const MULTI_WHALE_CONFIRMATION_COUNT = 2; // Core logic: wait for a 2nd whale
+const ALPHA_WHALE_COUNT = 50;
+const MULTI_WHALE_CONFIRMATION_COUNT = 2;
 const MULTI_WHALE_CONFIRMATION_WINDOW_MS = 30 * 60 * 1000;
 const MAX_HOLDER_CONCENTRATION_PERCENT = 20;
-const MIN_LIQUIDITY_LOCKED_PERCENT = 95; // NEW SECURITY CHECK: 95% of LP tokens must be locked/burned
-const SOLANA_BURN_ADDRESS = '11111111111111111111111111111111'; // NEW: Solana's official burn address
+const MIN_LIQUIDITY_LOCKED_PERCENT = 95;
+const SOLANA_BURN_ADDRESS = '11111111111111111111111111111111';
 const KNOWN_BUNDLER_PROGRAMS = new Set(['BUDDYtQp322nPXSv9hS2Smd4LBYf1s7mQYJgTL2t2d2', 'BUNd1Gmtipd8bT5i598acEaVz1sM2gUv1nKjPjr6a5a']);
 
 // --- DATABASE & REDIS CLIENTS ---
@@ -72,8 +73,8 @@ app.get('/config', (req, res) => {
         },
         displayRules: {
             messageOfTheDay: "Alpha tracking is active. Stay sharp!",
-            highConfidenceColor: "#29b6f6", // Light Blue
-            mediumConfidenceColor: "#ffee58" // Yellow
+            highConfidenceColor: "#29b6f6",
+            mediumConfidenceColor: "#ffee58"
         }
     });
 });
@@ -97,16 +98,9 @@ const retryWithBackoff = async (asyncFn, retries = 3, delay = 1000) => {
     }
 };
 
-/**
- * NEW SECURITY CHECK: Verifies if a significant portion of LP tokens are burned.
- * @param {string} pairAddress The mint address of the LP token from DexScreener.
- * @returns {Promise<{isLocked: boolean, percentage: number}>}
- */
 async function checkLiquidityLock(pairAddress) {
     try {
         const lpMintPublicKey = new PublicKey(pairAddress);
-        
-        // This is the known, official address where assets are sent to be burned (removed from circulation).
         const burnTokenAccounts = await solanaConnection.getTokenAccountsByOwner(new PublicKey(SOLANA_BURN_ADDRESS), { mint: lpMintPublicKey });
 
         let burnedAmount = 0;
@@ -135,7 +129,7 @@ async function checkLiquidityLock(pairAddress) {
 //                                  MAIN APPLICATION LOGIC
 // ==========================================================================================
 async function main() {
-    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.0 🚀");
+    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.1 (Elite Strategy) 🚀");
     await connectToServices();
     await runWhaleDiscoveryCycle();
     setInterval(runWhaleDiscoveryCycle, WHALE_DISCOVERY_INTERVAL);
@@ -153,8 +147,14 @@ async function connectToServices() {
 
     try {
         redisClient = createClient({ url: UPSTASH_REDIS_URL });
+        redisClient.on('error', (err) => console.error('[REDIS CLIENT ERROR]', err));
+        
         redisPublisher = redisClient.duplicate();
+        redisPublisher.on('error', (err) => console.error('[REDIS PUBLISHER ERROR]', err));
+
         redisSubscriber = redisClient.duplicate();
+        redisSubscriber.on('error', (err) => console.error('[REDIS SUBSCRIBER ERROR]', err));
+        
         await Promise.all([redisClient.connect(), redisPublisher.connect(), redisSubscriber.connect()]);
         console.log('[REDIS] ✅ Connected to Upstash Redis.');
 
@@ -217,12 +217,9 @@ async function runWhaleDiscoveryCycle() {
                 console.log("[DB] Whale list successfully updated in MongoDB.");
 
                 const newWhales = newAlphaWhalesData.map(w => w.address);
-                // We need a live WebSocket connection to send this, so we find one if it exists
-                // This part is for hot-reloading the list without a full restart
                 if (typeof pumpPortalWs !== 'undefined' && pumpPortalWs) {
                     updatePumpPortalSubscriptions(currentWhales, newWhales, pumpPortalWs);
                 }
-
             } catch (error) {
                 await session.abortTransaction();
                 throw error;
@@ -247,16 +244,17 @@ async function findSuccessfulTokens() {
         const maxAgeTimestamp = now - (MIN_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
         const minAgeTimestamp = now - (MAX_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
 
-        console.log(`[PHASE 1] Searching for tokens created between ${new Date(minAgeTimestamp).toLocaleDateString()} and ${new Date(maxAgeTimestamp).toLocaleDateString()}`);
+        console.log(`[PHASE 1] Searching for successful tokens created between ${new Date(minAgeTimestamp).toLocaleDateString()} and ${new Date(maxAgeTimestamp).toLocaleDateString()}`);
 
         const candidates = data.pairs.filter(p =>
             p.liquidity?.usd > MIN_LIQUIDITY_USD &&
-            p.priceChange?.h24 > MIN_PRICE_CHANGE_H24 &&
+            p.priceChange?.h6 > MIN_PRICE_CHANGE_H6 && // UPGRADED: Using 500% (6x) h6 price change
+            p.volume?.h6 > MIN_VOLUME_H6_USD && // NEW: Using $100k h6 volume
             p.pairCreatedAt > minAgeTimestamp && p.pairCreatedAt < maxAgeTimestamp
         );
         
-        console.log(`[PHASE 1] Found ${candidates.length} potential candidates from DexScreener.`);
-        return candidates; // DexScreener's creation time is reliable enough for this initial filter.
+        console.log(`[PHASE 1] Found ${candidates.length} potential high-quality candidates matching the elite criteria.`);
+        return candidates;
     } catch (error) {
         console.error("[ERROR] Failed to fetch successful tokens:", error.message);
         return [];
@@ -281,7 +279,7 @@ async function findAndFilterEarlyBuyers(tokenMintAddress) {
                 
                 const { source, destination } = ix.parsed.info;
                 if (!buyerTimestamps.has(destination)) buyerTimestamps.set(destination, { firstReceiveTime: tx.blockTime, firstSendTime: null });
-                const sourceEntry = buyerTimestamps.get(source);
+                const sourceEntry = buyer_timestamps.get(source);
                 if (sourceEntry && !sourceEntry.firstSendTime) sourceEntry.firstSendTime = tx.blockTime;
             }
         }
@@ -334,7 +332,7 @@ async function handlePumpPortalMessage(data) {
         if (message.user && message.isBuy) {
             const isAlphaWhale = await Whale.findOne({ address: message.user });
             if (isAlphaWhale) {
-                console.log(`[PHASE 2]  detected buy from Alpha Whale: ${message.user}`);
+                console.log(`[PHASE 2] Detected buy from Alpha Whale: ${message.user}`);
                 handleAlphaWhaleTrade(message);
             }
         }
@@ -393,7 +391,7 @@ async function vetToken(tokenAddress) {
         report.name = pair.baseToken?.name;
         report.symbol = pair.baseToken?.symbol;
         
-        // 1. Liquidity Lock Check (30 points) - NEW & HIGH PRIORITY
+        // 1. Liquidity Lock Check (30 points)
         const lpCheck = await checkLiquidityLock(pair.pairAddress);
         report.checks.isLiquidityLocked = lpCheck.isLocked;
         report.liquidityLockedPercentage = lpCheck.percentage;
@@ -423,7 +421,7 @@ async function vetToken(tokenAddress) {
         report.checks.notFromBundler = !isBundled;
         if (report.checks.notFromBundler) score += 10;
 
-        // 5. Socials Check (10 points) - Lower priority
+        // 5. Socials Check (10 points)
         report.checks.hasSocials = (pair.info?.socials?.length || 0) > 0;
         if (report.checks.hasSocials) score += 10;
 

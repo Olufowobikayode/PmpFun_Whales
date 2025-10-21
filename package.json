@@ -1,0 +1,25 @@
+{
+  "name": "alpha-scout-engine",
+  "version": "5.0.0",
+  "description": "Hardened backend engine for the Alpha PumpFun Scout extension using a tuned strategy.",
+  "main": "scouter.js",
+  "scripts": {
+    "start": "node scouter.js",
+    "dev": "node scouter.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@solana/spl-token": "^0.4.3",
+    "@solana/web3.js": "^1.91.4",
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.2",
+    "redis": "^4.6.13",
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

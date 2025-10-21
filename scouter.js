@@ -33,9 +33,9 @@ const PUMP_PORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 // --- STRATEGY & VETTING TUNING (Version 5.5 - Resilient Pipeline) ---
 const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000;
 const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60;
-const MIN_LIQUIDITY_USD = 20000;
-const MIN_PRICE_CHANGE_H6 = 300; // 300% = 4x gain in 6 hours
-const MIN_VOLUME_H6_USD = 40000;
+const MIN_LIQUIDITY_USD = 20000; // Relaxed slightly for first run
+const MIN_PRICE_CHANGE_H6 = 300; // Relaxed slightly for first run (300% = 4x)
+const MIN_VOLUME_H6_USD = 40000; // Relaxed slightly for first run
 const MAX_TOKEN_AGE_DAYS = 14;
 const MIN_TOKEN_AGE_DAYS = 3;
 const MIN_CORRELATED_SUCCESSES = 2;
@@ -171,6 +171,7 @@ async function runWhaleDiscoveryCycle() {
         const successfulTokens = await findSuccessfulTokens();
         if (successfulTokens.length === 0) {
             console.log("[PHASE 1] No successful tokens found in this cycle. Waiting for the next run.");
+            console.log("[PHASE 1] Whale discovery cycle finished.");
             return;
         }
 
@@ -230,7 +231,6 @@ async function runWhaleDiscoveryCycle() {
     console.log("[PHASE 1] Whale discovery cycle finished.");
 }
 
-// UPGRADED: A more resilient pipeline using a different endpoint for detailed stats
 async function findSuccessfulTokens() {
     console.log('[PHASE 1] Starting new token discovery pipeline...');
     try {
@@ -263,10 +263,8 @@ async function findSuccessfulTokens() {
         for (let i = 0; i < tokenAddresses.length; i += 30) {
             const batch = tokenAddresses.slice(i, i + 30);
             try {
-                // BUG FIX: Switched to the more stable /tokens endpoint
                 const { data: batchDetails } = await axios.get(`${DEX_SCREENER_API_URL}/dex/tokens/${batch.join(',')}`);
                 if (batchDetails.pairs) {
-                    // We only want pairs that trade against SOL
                     const solPairs = batchDetails.pairs.filter(p => p.quoteToken.symbol === 'SOL');
                     detailedPairs.push(...solPairs);
                 }

@@ -7,7 +7,7 @@
  * This is the complete, unabridged source code file.
  *
  * Author: Gemini (Refined with User Feedback)
- * Version: 5.3 (Pipeline Strategy)
+ * Version: 5.4 (Final Pipeline)
  */
 
 require('dotenv').config();
@@ -30,10 +30,10 @@ const UPSTASH_REDIS_URL = process.env.UPSTASH_REDIS_URL;
 const DEX_SCREENER_API_URL = 'https://api.dexscreener.com/latest/dex';
 const PUMP_PORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 
-// --- STRATEGY & VETTING TUNING (Version 5.3 - Pipeline) ---
+// --- STRATEGY & VETTING TUNING (Version 5.4 - Final Pipeline) ---
 const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000;
 const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60;
-const MIN_LIQUIDITY_USD = 25000; // Lowered slightly to catch more rising stars
+const MIN_LIQUIDITY_USD = 25000;
 const MIN_PRICE_CHANGE_H6 = 500; // 500% (6x) gain in 6 hours
 const MIN_VOLUME_H6_USD = 50000; // $50k volume in 6 hours
 const MAX_TOKEN_AGE_DAYS = 14;
@@ -102,18 +102,14 @@ async function checkLiquidityLock(pairAddress) {
     try {
         const lpMintPublicKey = new PublicKey(pairAddress);
         const burnTokenAccounts = await solanaConnection.getTokenAccountsByOwner(new PublicKey(SOLANA_BURN_ADDRESS), { mint: lpMintPublicKey });
-
         let burnedAmount = 0;
         if (burnTokenAccounts.value.length > 0) {
             const burnAccountInfo = await solanaConnection.getTokenAccountBalance(burnTokenAccounts.value[0].pubkey);
             burnedAmount = parseFloat(burnAccountInfo.value.uiAmountString || '0');
         }
-        
         const totalSupplyData = await retryWithBackoff(() => solanaConnection.getTokenSupply(lpMintPublicKey));
         const totalSupply = parseFloat(totalSupplyData.value.uiAmountString || '1');
-
         if (totalSupply === 0) return { isLocked: false, percentage: 0 };
-        
         const percentage = (burnedAmount / totalSupply) * 100;
         return {
             isLocked: percentage >= MIN_LIQUIDITY_LOCKED_PERCENT,
@@ -129,7 +125,7 @@ async function checkLiquidityLock(pairAddress) {
 //                                  MAIN APPLICATION LOGIC
 // ==========================================================================================
 async function main() {
-    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.3 (Pipeline Strategy) 🚀");
+    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.4 (Final Pipeline) 🚀");
     await connectToServices();
     await runWhaleDiscoveryCycle();
     setInterval(runWhaleDiscoveryCycle, WHALE_DISCOVERY_INTERVAL);
@@ -144,20 +140,15 @@ async function connectToServices() {
         console.error('[DB] ❌ Could not connect to MongoDB Atlas.', error);
         process.exit(1);
     }
-
     try {
         redisClient = createClient({ url: UPSTASH_REDIS_URL });
         redisClient.on('error', (err) => console.error('[REDIS CLIENT ERROR]', err));
-        
         redisPublisher = redisClient.duplicate();
         redisPublisher.on('error', (err) => console.error('[REDIS PUBLISHER ERROR]', err));
-
         redisSubscriber = redisClient.duplicate();
         redisSubscriber.on('error', (err) => console.error('[REDIS SUBSCRIBER ERROR]', err));
-        
         await Promise.all([redisClient.connect(), redisPublisher.connect(), redisSubscriber.connect()]);
         console.log('[REDIS] ✅ Connected to Upstash Redis.');
-
         await redisSubscriber.subscribe('alpha-alerts', (message) => {
             const report = JSON.parse(message);
             console.log(`[PUBSUB] Received alert for ${report.symbol} from Redis. Broadcasting to ${localWss.clients.size} clients.`);
@@ -165,7 +156,6 @@ async function connectToServices() {
                 if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: 'NEW_ALPHA_ALERT', data: report }));
             });
         });
-
     } catch (error) {
         console.error('[REDIS] ❌ Could not connect to Upstash Redis.', error);
         process.exit(1);
@@ -188,26 +178,20 @@ async function runWhaleDiscoveryCycle() {
                 console.log(`[PHASE 1]  -> Found ${patientBuyers.size} patient early buyers who held for >3 days.`);
             }
         }
-        
         const buyerSuccessCounts = new Map();
         for (const buyers of tokenToPatientBuyers.values()) {
             for (const buyer of buyers) {
                 buyerSuccessCounts.set(buyer, (buyerSuccessCounts.get(buyer) || 0) + 1);
             }
         }
-        
         const correlatedWhalesData = Array.from(buyerSuccessCounts.entries())
             .filter(([_, count]) => count >= MIN_CORRELATED_SUCCESSES)
             .map(([address, successes]) => ({ address, successes }));
-
         correlatedWhalesData.sort((a, b) => b.successes - a.successes);
-        
         const newAlphaWhalesData = correlatedWhalesData.slice(0, ALPHA_WHALE_COUNT);
-
         if (newAlphaWhalesData.length > 0) {
             console.log(`🏆 [PHASE 1] Top ${newAlphaWhalesData.length} correlated whales found. Updating database... 🏆`);
             const currentWhales = (await Whale.find({}).select('address')).map(w => w.address);
-            
             const session = await mongoose.startSession();
             session.startTransaction();
             try {
@@ -215,7 +199,6 @@ async function runWhaleDiscoveryCycle() {
                 await Whale.insertMany(newAlphaWhalesData, { session });
                 await session.commitTransaction();
                 console.log("[DB] Whale list successfully updated in MongoDB.");
-
                 const newWhales = newAlphaWhalesData.map(w => w.address);
                 if (typeof pumpPortalWs !== 'undefined' && pumpPortalWs) {
                     updatePumpPortalSubscriptions(currentWhales, newWhales, pumpPortalWs);
@@ -239,20 +222,20 @@ async function runWhaleDiscoveryCycle() {
 async function findSuccessfulTokens() {
     console.log('[PHASE 1] Starting new token discovery pipeline...');
     try {
-        // STEP 1: Get a broad list of new pairs on Solana.
-        const { data: newPairsData } = await axios.get(`${DEX_SCREENER_API_URL}/dex/pairs/solana/new`);
-        if (!newPairsData.pairs || newPairsData.pairs.length === 0) {
-            console.log(`[PHASE 1] Step 1/4: DexScreener 'new pairs' endpoint returned no data.`);
+        // STEP 1: Broad search for all SOL pairs. This is more reliable.
+        const { data: searchData } = await axios.get(`${DEX_SCREENER_API_URL}/search?q=SOL`);
+        if (!searchData.pairs || searchData.pairs.length === 0) {
+            console.log(`[PHASE 1] Step 1/4: DexScreener broad search returned no initial candidates.`);
             return [];
         }
-        console.log(`[PHASE 1] Step 1/4: Fetched ${newPairsData.pairs.length} recent pairs from DexScreener.`);
+        console.log(`[PHASE 1] Step 1/4: Fetched ${searchData.pairs.length} total pairs trading against SOL.`);
 
-        // STEP 2: Pre-filter by age.
+        // STEP 2: Pre-filter by our age window.
         const now = Date.now();
         const maxAgeTimestamp = now - (MIN_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
         const minAgeTimestamp = now - (MAX_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
-        
-        const ageFilteredPairs = newPairsData.pairs.filter(p =>
+
+        const ageFilteredPairs = searchData.pairs.filter(p =>
             p.pairCreatedAt > minAgeTimestamp && p.pairCreatedAt < maxAgeTimestamp
         );
 
@@ -273,11 +256,10 @@ async function findSuccessfulTokens() {
                     detailedPairs.push(...batchDetails.pairs);
                 }
             } catch (batchError) {
-                 // It's common for some pairs in a batch to become invalid, so we log a warning but continue
                  if (batchError.response && batchError.response.status === 404) {
                     console.warn(`[PHASE 1] A batch query contained invalid pairs, which is normal. Continuing...`);
                 } else {
-                    throw batchError; // Re-throw if it's a more serious error
+                    throw batchError;
                 }
             }
         }
@@ -317,7 +299,7 @@ async function findAndFilterEarlyBuyers(tokenMintAddress) {
                 const { source, destination } = ix.parsed.info;
                 if (!buyerTimestamps.has(destination)) buyerTimestamps.set(destination, { firstReceiveTime: tx.blockTime, firstSendTime: null });
                 
-                // BUG FIX: Corrected variable name from buyer_timestamps to buyerTimestamps
+                // BUG FIX from previous versions: Corrected variable name from buyer_timestamps to buyerTimestamps
                 const sourceEntry = buyerTimestamps.get(source);
                 if (sourceEntry && !sourceEntry.firstSendTime) sourceEntry.firstSendTime = tx.blockTime;
             }

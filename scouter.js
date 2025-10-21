@@ -7,7 +7,7 @@
  * This is the complete, unabridged source code file.
  *
  * Author: Gemini (Refined with User Feedback)
- * Version: 5.4 (Final Pipeline)
+ * Version: 5.5 (Resilient Pipeline)
  */
 
 require('dotenv').config();
@@ -27,15 +27,15 @@ const PORT = process.env.PORT || 8080;
 const SOLANA_RPC_URL = process.env.RPC_URL || clusterApiUrl('mainnet-beta');
 const MONGO_URI = process.env.MONGO_URI;
 const UPSTASH_REDIS_URL = process.env.UPSTASH_REDIS_URL;
-const DEX_SCREENER_API_URL = 'https://api.dexscreener.com/latest/dex';
+const DEX_SCREENER_API_URL = 'https://api.dexscreener.com/latest';
 const PUMP_PORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 
-// --- STRATEGY & VETTING TUNING (Version 5.4 - Final Pipeline) ---
+// --- STRATEGY & VETTING TUNING (Version 5.5 - Resilient Pipeline) ---
 const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000;
 const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60;
-const MIN_LIQUIDITY_USD = 25000;
-const MIN_PRICE_CHANGE_H6 = 500; // 500% (6x) gain in 6 hours
-const MIN_VOLUME_H6_USD = 50000; // $50k volume in 6 hours
+const MIN_LIQUIDITY_USD = 20000;
+const MIN_PRICE_CHANGE_H6 = 300; // 300% = 4x gain in 6 hours
+const MIN_VOLUME_H6_USD = 40000;
 const MAX_TOKEN_AGE_DAYS = 14;
 const MIN_TOKEN_AGE_DAYS = 3;
 const MIN_CORRELATED_SUCCESSES = 2;
@@ -125,7 +125,7 @@ async function checkLiquidityLock(pairAddress) {
 //                                  MAIN APPLICATION LOGIC
 // ==========================================================================================
 async function main() {
-    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.4 (Final Pipeline) 🚀");
+    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.5 (Resilient Pipeline) 🚀");
     await connectToServices();
     await runWhaleDiscoveryCycle();
     setInterval(runWhaleDiscoveryCycle, WHALE_DISCOVERY_INTERVAL);
@@ -169,6 +169,11 @@ async function runWhaleDiscoveryCycle() {
     console.log("\n[PHASE 1] Starting new weekly whale discovery cycle...");
     try {
         const successfulTokens = await findSuccessfulTokens();
+        if (successfulTokens.length === 0) {
+            console.log("[PHASE 1] No successful tokens found in this cycle. Waiting for the next run.");
+            return;
+        }
+
         const tokenToPatientBuyers = new Map();
         for (const token of successfulTokens) {
             console.log(`[PHASE 1] Analyzing token: ${token.baseToken.symbol} (${token.baseToken.address})`);
@@ -178,20 +183,26 @@ async function runWhaleDiscoveryCycle() {
                 console.log(`[PHASE 1]  -> Found ${patientBuyers.size} patient early buyers who held for >3 days.`);
             }
         }
+        
         const buyerSuccessCounts = new Map();
         for (const buyers of tokenToPatientBuyers.values()) {
             for (const buyer of buyers) {
                 buyerSuccessCounts.set(buyer, (buyerSuccessCounts.get(buyer) || 0) + 1);
             }
         }
+        
         const correlatedWhalesData = Array.from(buyerSuccessCounts.entries())
             .filter(([_, count]) => count >= MIN_CORRELATED_SUCCESSES)
             .map(([address, successes]) => ({ address, successes }));
+
         correlatedWhalesData.sort((a, b) => b.successes - a.successes);
+        
         const newAlphaWhalesData = correlatedWhalesData.slice(0, ALPHA_WHALE_COUNT);
+
         if (newAlphaWhalesData.length > 0) {
             console.log(`🏆 [PHASE 1] Top ${newAlphaWhalesData.length} correlated whales found. Updating database... 🏆`);
             const currentWhales = (await Whale.find({}).select('address')).map(w => w.address);
+            
             const session = await mongoose.startSession();
             session.startTransaction();
             try {
@@ -199,6 +210,7 @@ async function runWhaleDiscoveryCycle() {
                 await Whale.insertMany(newAlphaWhalesData, { session });
                 await session.commitTransaction();
                 console.log("[DB] Whale list successfully updated in MongoDB.");
+
                 const newWhales = newAlphaWhalesData.map(w => w.address);
                 if (typeof pumpPortalWs !== 'undefined' && pumpPortalWs) {
                     updatePumpPortalSubscriptions(currentWhales, newWhales, pumpPortalWs);
@@ -218,12 +230,12 @@ async function runWhaleDiscoveryCycle() {
     console.log("[PHASE 1] Whale discovery cycle finished.");
 }
 
-// UPGRADED: Switched to a robust, multi-step pipeline strategy
+// UPGRADED: A more resilient pipeline using a different endpoint for detailed stats
 async function findSuccessfulTokens() {
     console.log('[PHASE 1] Starting new token discovery pipeline...');
     try {
-        // STEP 1: Broad search for all SOL pairs. This is more reliable.
-        const { data: searchData } = await axios.get(`${DEX_SCREENER_API_URL}/search?q=SOL`);
+        // STEP 1: Broad search for all SOL pairs.
+        const { data: searchData } = await axios.get(`${DEX_SCREENER_API_URL}/dex/search?q=SOL`);
         if (!searchData.pairs || searchData.pairs.length === 0) {
             console.log(`[PHASE 1] Step 1/4: DexScreener broad search returned no initial candidates.`);
             return [];
@@ -245,22 +257,21 @@ async function findSuccessfulTokens() {
         }
         console.log(`[PHASE 1] Step 2/4: ${ageFilteredPairs.length} pairs match our age criteria.`);
 
-        // STEP 3: Batch query for detailed stats on our potential candidates.
-        const pairAddresses = ageFilteredPairs.map(p => p.pairAddress);
+        // STEP 3: Batch query for detailed stats using the more reliable /tokens endpoint.
+        const tokenAddresses = ageFilteredPairs.map(p => p.baseToken.address);
         const detailedPairs = [];
-        for (let i = 0; i < pairAddresses.length; i += 30) {
-            const batch = pairAddresses.slice(i, i + 30);
+        for (let i = 0; i < tokenAddresses.length; i += 30) {
+            const batch = tokenAddresses.slice(i, i + 30);
             try {
-                const { data: batchDetails } = await axios.get(`${DEX_SCREENER_API_URL}/dex/pairs/solana/${batch.join(',')}`);
+                // BUG FIX: Switched to the more stable /tokens endpoint
+                const { data: batchDetails } = await axios.get(`${DEX_SCREENER_API_URL}/dex/tokens/${batch.join(',')}`);
                 if (batchDetails.pairs) {
-                    detailedPairs.push(...batchDetails.pairs);
+                    // We only want pairs that trade against SOL
+                    const solPairs = batchDetails.pairs.filter(p => p.quoteToken.symbol === 'SOL');
+                    detailedPairs.push(...solPairs);
                 }
             } catch (batchError) {
-                 if (batchError.response && batchError.response.status === 404) {
-                    console.warn(`[PHASE 1] A batch query contained invalid pairs, which is normal. Continuing...`);
-                } else {
-                    throw batchError;
-                }
+                console.warn(`[PHASE 1] A batch query may have failed or returned no pairs. Continuing...`);
             }
         }
         console.log(`[PHASE 1] Step 3/4: Fetched detailed stats for ${detailedPairs.length} pairs.`);
@@ -272,7 +283,7 @@ async function findSuccessfulTokens() {
             p.volume?.h6 > MIN_VOLUME_H6_USD
         );
 
-        console.log(`[PHASE 1] Step 4/4: Found ${successfulTokens.length} high-quality candidates matching the elite criteria.`);
+        console.log(`[PHASE 1] Step 4/4: Found ${successfulTokens.length} high-quality candidates matching the criteria.`);
         return successfulTokens;
     } catch (error) {
         console.error("[ERROR] Failed to fetch successful tokens during pipeline:", error.message);
@@ -299,7 +310,6 @@ async function findAndFilterEarlyBuyers(tokenMintAddress) {
                 const { source, destination } = ix.parsed.info;
                 if (!buyerTimestamps.has(destination)) buyerTimestamps.set(destination, { firstReceiveTime: tx.blockTime, firstSendTime: null });
                 
-                // BUG FIX from previous versions: Corrected variable name from buyer_timestamps to buyerTimestamps
                 const sourceEntry = buyerTimestamps.get(source);
                 if (sourceEntry && !sourceEntry.firstSendTime) sourceEntry.firstSendTime = tx.blockTime;
             }
@@ -324,7 +334,6 @@ async function findAndFilterEarlyBuyers(tokenMintAddress) {
 // PHASE 2: DYNAMIC REAL-TIME MONITORING
 // ==========================================================================================
 let pumpPortalWs = null;
-
 async function connectToPumpPortal() {
     console.log("[PHASE 2] Connecting to PumpPortal WebSocket...");
     pumpPortalWs = new WebSocket(PUMP_PORTAL_WS_URL);
@@ -402,7 +411,7 @@ async function vetToken(tokenAddress) {
         const report = { tokenAddress, checks: {} };
         let score = 0;
 
-        const { data } = await axios.get(`${DEX_SCREENER_API_URL}/search?q=${tokenAddress}`);
+        const { data } = await axios.get(`${DEX_SCREENER_API_URL}/dex/search?q=${tokenAddress}`);
         const pair = data.pairs?.find(p => p.baseToken.address === tokenAddress);
         if (!pair) {
             console.warn(`[WARN] Could not find pair data on DexScreener for ${tokenAddress}`);

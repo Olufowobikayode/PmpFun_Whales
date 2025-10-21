@@ -1,12 +1,13 @@
 /**
- * Crypto Alpha Finder Backend Engine - Hardened & Tuned
+ * Crypto Alpha Finder Backend Engine - Professional API Strategy
  *
- * This version implements paginated data fetching from DexScreener to build a
- * large, high-quality pool of candidates for whale discovery.
+ * This version uses a professional data pipeline and features a rewritten,
+ * efficient vetting process that correctly utilizes all available data
+ * to perform a complete security analysis, including liquidity lock checks.
  * This is the complete, unabridged source code file.
  *
- * Author: Gemini (Refined with User Feedback)
- * Version: 5.6 (Paginated Fetching)
+ * Author: Gemini & User Collaboration
+ * Version: 7.1 (Efficient Vetting)
  */
 
 require('dotenv').config();
@@ -26,16 +27,17 @@ const PORT = process.env.PORT || 8080;
 const SOLANA_RPC_URL = process.env.RPC_URL || clusterApiUrl('mainnet-beta');
 const MONGO_URI = process.env.MONGO_URI;
 const UPSTASH_REDIS_URL = process.env.UPSTASH_REDIS_URL;
-const DEX_SCREENER_API_URL = 'https://api.dexscreener.com/latest';
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
+const GECKO_TERMINAL_API_URL = 'https://api.geckoterminal.com/api/v2';
+const BIRDEYE_API_URL = 'https://public-api.birdeye.so';
 const PUMP_PORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 
-// --- STRATEGY & VETTING TUNING (Version 5.6 - Paginated Fetching) ---
-const PAGINATION_PAGE_COUNT = 40; // NEW: Fetch 10 pages to get ~300 pairs.
+// --- STRATEGY & VETTING TUNING (Version 7.1) ---
 const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000;
 const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60;
-const MIN_LIQUIDITY_USD = 20000;
-const MIN_PRICE_CHANGE_H6 = 300;
-const MIN_VOLUME_H6_USD = 40000;
+const MIN_LIQUIDITY_USD = 15000;
+const MIN_PRICE_CHANGE_H6 = 200;
+const MIN_VOLUME_H6_USD = 50000;
 const MAX_TOKEN_AGE_DAYS = 14;
 const MIN_TOKEN_AGE_DAYS = 3;
 const MIN_CORRELATED_SUCCESSES = 2;
@@ -48,34 +50,16 @@ const SOLANA_BURN_ADDRESS = '11111111111111111111111111111111';
 const KNOWN_BUNDLER_PROGRAMS = new Set(['BUDDYtQp322nPXSv9hS2Smd4LBYf1s7mQYJgTL2t2d2', 'BUNd1Gmtipd8bT5i598acEaVz1sM2gUv1nKjPjr6a5a']);
 
 // --- DATABASE & REDIS CLIENTS ---
-let redisClient;
-let redisPublisher;
-let redisSubscriber;
+let redisClient, redisPublisher, redisSubscriber;
 const solanaConnection = new Connection(SOLANA_RPC_URL, { commitment: 'confirmed' });
-
-const whaleSchema = new mongoose.Schema({
-    address: { type: String, required: true, unique: true },
-    successes: Number,
-    discoveredAt: { type: Date, default: Date.now }
-});
+const whaleSchema = new mongoose.Schema({ address: { type: String, required: true, unique: true }, successes: Number, discoveredAt: { type: Date, default: Date.now } });
 const Whale = mongoose.model('Whale', whaleSchema);
 
 // --- SERVER SETUP ---
 const app = express();
 const server = http.createServer(app);
 const localWss = new WebSocket.Server({ server });
-
-app.get('/config', (req, res) => {
-    res.json({
-        featureFlags: { showConfidenceScore: true, showAlertForMediumConfidence: true },
-        displayRules: {
-            messageOfTheDay: "Alpha tracking is active. Stay sharp!",
-            highConfidenceColor: "#29b6f6",
-            mediumConfidenceColor: "#ffee58"
-        }
-    });
-});
-
+app.get('/config', (req, res) => res.json({ featureFlags: { showConfidenceScore: true, showAlertForMediumConfidence: true }, displayRules: { messageOfTheDay: "Alpha tracking is active. Stay sharp!", highConfidenceColor: "#29b6f6", mediumConfidenceColor: "#ffee58" } }));
 localWss.on('connection', ws => console.log('[SERVER] Extension client connected.'));
 server.listen(PORT, () => console.log(`[SERVER] Alpha Engine listening on port ${PORT}`));
 
@@ -106,10 +90,7 @@ async function checkLiquidityLock(pairAddress) {
         const totalSupply = parseFloat(totalSupplyData.value.uiAmountString || '1');
         if (totalSupply === 0) return { isLocked: false, percentage: 0 };
         const percentage = (burnedAmount / totalSupply) * 100;
-        return {
-            isLocked: percentage >= MIN_LIQUIDITY_LOCKED_PERCENT,
-            percentage: parseFloat(percentage.toFixed(2))
-        };
+        return { isLocked: percentage >= MIN_LIQUIDITY_LOCKED_PERCENT, percentage: parseFloat(percentage.toFixed(2)) };
     } catch (error) {
         console.warn(`[WARN] Could not check liquidity lock for ${pairAddress}: ${error.message}`);
         return { isLocked: false, percentage: 0 };
@@ -120,7 +101,7 @@ async function checkLiquidityLock(pairAddress) {
 //                                  MAIN APPLICATION LOGIC
 // ==========================================================================================
 async function main() {
-    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.6 (Paginated Fetching) 🚀");
+    console.log("🚀 Initializing Alpha Finder Engine v7.1 (Efficient Vetting) 🚀");
     await connectToServices();
     await runWhaleDiscoveryCycle();
     setInterval(runWhaleDiscoveryCycle, WHALE_DISCOVERY_INTERVAL);
@@ -207,68 +188,64 @@ async function runWhaleDiscoveryCycle() {
     console.log("[PHASE 1] Whale discovery cycle finished.");
 }
 
-// UPGRADED: Implemented pagination to fetch a large pool of candidates.
 async function findSuccessfulTokens() {
     console.log('[PHASE 1] Starting new token discovery pipeline...');
     try {
-        // STEP 1: Fetch multiple pages of SOL pairs to build a large candidate list.
-        const allPairs = [];
-        console.log(`[PHASE 1] Step 1/4: Fetching ${PAGINATION_PAGE_COUNT} pages of data from DexScreener...`);
-        for (let page = 1; page <= PAGINATION_PAGE_COUNT; page++) {
-            try {
-                const { data: searchData } = await axios.get(`${DEX_SCREENER_API_URL}/dex/search?q=SOL&page=${page}`);
-                if (searchData.pairs && searchData.pairs.length > 0) {
-                    allPairs.push(...searchData.pairs);
-                } else {
-                    // Stop if a page returns no pairs
-                    break;
-                }
-                // Be a good API citizen and wait briefly between requests
-                await new Promise(res => setTimeout(res, 250));
-            } catch (pageError) {
-                console.warn(`[PHASE 1] Warning: Could not fetch page ${page}. Continuing...`);
-            }
+        const { data: geckoData } = await axios.get(`${GECKO_TERMINAL_API_URL}/networks/solana/new_pools`);
+        const newPools = geckoData.data;
+        if (!newPools || newPools.length === 0) {
+            console.log(`[PHASE 1] Step 1/4: GeckoTerminal returned no new pools.`);
+            return [];
         }
-        console.log(`[PHASE 1] Step 1/4: Fetched a total of ${allPairs.length} pairs across ${PAGINATION_PAGE_COUNT} pages.`);
-
-        // STEP 2: Pre-filter by our age window.
+        console.log(`[PHASE 1] Step 1/4: Fetched ${newPools.length} new pools from GeckoTerminal.`);
         const now = Date.now();
         const maxAgeTimestamp = now - (MIN_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
         const minAgeTimestamp = now - (MAX_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
-        const ageFilteredPairs = allPairs.filter(p => p.pairCreatedAt > minAgeTimestamp && p.pairCreatedAt < maxAgeTimestamp);
-        if (ageFilteredPairs.length === 0) {
-            console.log(`[PHASE 1] Step 2/4: No pairs found within the ${MIN_TOKEN_AGE_DAYS}-${MAX_TOKEN_AGE_DAYS} day age window.`);
+        const ageFilteredPools = newPools.filter(pool => {
+            const creationTime = new Date(pool.attributes.pool_created_at).getTime();
+            return creationTime > minAgeTimestamp && creationTime < maxAgeTimestamp;
+        });
+        if (ageFilteredPools.length === 0) {
+            console.log(`[PHASE 1] Step 2/4: No pools found within the ${MIN_TOKEN_AGE_DAYS}-${MAX_TOKEN_AGE_DAYS} day age window.`);
             return [];
         }
-        console.log(`[PHASE 1] Step 2/4: ${ageFilteredPairs.length} pairs match our age criteria.`);
-
-        // STEP 3: Batch query for detailed stats.
-        const tokenAddresses = ageFilteredPairs.map(p => p.baseToken.address);
-        const detailedPairs = [];
-        for (let i = 0; i < tokenAddresses.length; i += 30) {
-            const batch = tokenAddresses.slice(i, i + 30);
-            try {
-                const { data: batchDetails } = await axios.get(`${DEX_SCREENER_API_URL}/dex/tokens/${batch.join(',')}`);
-                if (batchDetails.pairs) {
-                    const solPairs = batchDetails.pairs.filter(p => p.quoteToken.symbol === 'SOL');
-                    detailedPairs.push(...solPairs);
-                }
-            } catch (batchError) {
-                console.warn(`[PHASE 1] A batch query may have failed. Continuing...`);
+        console.log(`[PHASE 1] Step 2/4: ${ageFilteredPools.length} pools match our age criteria.`);
+        const tokenAddresses = ageFilteredPools.map(pool => pool.relationships.base_token.data.id.split('_')[1]);
+        const { data: birdeyeData } = await axios.get(`${BIRDEYE_API_URL}/defi/multi_price?list_address=${tokenAddresses.join(',')}`, {
+            headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+        });
+        if (!birdeyeData.data || Object.keys(birdeyeData.data).length === 0) {
+            console.log(`[PHASE 1] Step 3/4: Birdeye returned no performance data for the candidates.`);
+            return [];
+        }
+        console.log(`[PHASE 1] Step 3/4: Fetched detailed stats for ${Object.keys(birdeyeData.data).length} tokens from Birdeye.`);
+        const successfulTokens = [];
+        for (const tokenAddress in birdeyeData.data) {
+            const tokenData = birdeyeData.data[tokenAddress];
+            const poolInfo = ageFilteredPools.find(p => p.relationships.base_token.data.id.endsWith(tokenAddress));
+            if (!tokenData || !poolInfo) continue;
+            const priceChangeH6 = (tokenData.priceChange6h || 0); // Birdeye price change is a multiplier, not percentage
+            if (
+                tokenData.liquidity > MIN_LIQUIDITY_USD &&
+                (priceChangeH6 * 100) > MIN_PRICE_CHANGE_H6 &&
+                tokenData.v6hUSD > MIN_VOLUME_H6_USD
+            ) {
+                successfulTokens.push({
+                    pairAddress: poolInfo.id.split('_')[1],
+                    baseToken: { address: tokenAddress, name: poolInfo.attributes.name, symbol: tokenData.symbol },
+                    quoteToken: { symbol: 'SOL' },
+                    liquidity: { usd: tokenData.liquidity },
+                    priceChange: { h6: priceChangeH6 * 100 },
+                    volume: { h6: tokenData.v6hUSD },
+                    pairCreatedAt: new Date(poolInfo.attributes.pool_created_at).getTime(),
+                    info: {} 
+                });
             }
         }
-        console.log(`[PHASE 1] Step 3/4: Fetched detailed stats for ${detailedPairs.length} pairs.`);
-
-        // STEP 4: Apply our final filters.
-        const successfulTokens = detailedPairs.filter(p =>
-            p.liquidity?.usd > MIN_LIQUIDITY_USD &&
-            p.priceChange?.h6 > MIN_PRICE_CHANGE_H6 &&
-            p.volume?.h6 > MIN_VOLUME_H6_USD
-        );
-        console.log(`[PHASE 1] Step 4/4: Found ${successfulTokens.length} high-quality candidates matching the criteria.`);
+        console.log(`[PHASE 1] Step 4/4: Found ${successfulTokens.length} high-quality candidates matching all criteria.`);
         return successfulTokens;
     } catch (error) {
-        console.error("[ERROR] Failed to fetch successful tokens during pipeline:", error.message);
+        console.error("[ERROR] Failed to fetch successful tokens during pipeline:", error.response ? error.response.data : error.message);
         return [];
     }
 }
@@ -380,37 +357,51 @@ async function vetToken(tokenAddress) {
         const pk = new PublicKey(tokenAddress);
         const report = { tokenAddress, checks: {} };
         let score = 0;
-        const { data } = await axios.get(`${DEX_SCREENER_API_URL}/dex/search?q=${tokenAddress}`);
-        const pair = data.pairs?.find(p => p.baseToken.address === tokenAddress);
-        if (!pair) {
-            console.warn(`[WARN] Could not find pair data on DexScreener for ${tokenAddress}`);
-            return;
+        const [birdeyeOverviewData, onChainData] = await Promise.all([
+            axios.get(`${BIRDEYE_API_URL}/defi/token_overview?address=${tokenAddress}`, { headers: { 'X-API-KEY': BIRDEYE_API_KEY } }),
+            Promise.all([
+                retryWithBackoff(() => getMint(solanaConnection, pk)),
+                retryWithBackoff(() => solanaConnection.getTokenLargestAccounts(pk)),
+                retryWithBackoff(() => solanaConnection.getTokenSupply(pk)),
+                retryWithBackoff(() => solanaConnection.getSignaturesForAddress(pk, { limit: 1 }))
+            ])
+        ]);
+        const tokenInfo = birdeyeOverviewData.data.data;
+        if (!tokenInfo) {
+             console.warn(`[WARN] Could not find token overview on Birdeye for ${tokenAddress}`);
+             return;
         }
-        report.name = pair.baseToken?.name;
-        report.symbol = pair.baseToken?.symbol;
-        const lpCheck = await checkLiquidityLock(pair.pairAddress);
-        report.checks.isLiquidityLocked = lpCheck.isLocked;
-        report.liquidityLockedPercentage = lpCheck.percentage;
-        if (lpCheck.isLocked) score += 30;
-        const mint = await retryWithBackoff(() => getMint(solanaConnection, pk));
+        report.name = tokenInfo.name;
+        report.symbol = tokenInfo.symbol;
+        const [mint, largestAccounts, totalSupplyData, sigs] = onChainData;
+
+        // Use a different Birdeye endpoint to find the pair address efficiently
+        const { data: pairsData } = await axios.get(`${BIRDEYE_API_URL}/defi/token_list?sort_by=v24hUSD&sort_type=desc`);
+        const primaryPair = pairsData.data.tokens.find(t => t.address === tokenAddress);
+        const pairAddress = primaryPair ? primaryPair.liquidityPool : null;
+        
+        if (pairAddress) {
+            const lpCheck = await checkLiquidityLock(pairAddress);
+            report.checks.isLiquidityLocked = lpCheck.isLocked;
+            report.liquidityLockedPercentage = lpCheck.percentage;
+            if (lpCheck.isLocked) score += 30;
+        } else {
+            report.checks.isLiquidityLocked = 'Unknown';
+            console.warn(`[WARN] Could not determine primary pair address for ${tokenAddress} to check LP lock.`);
+        }
         report.checks.isMintRevoked = mint.mintAuthority === null;
         if (report.checks.isMintRevoked) score += 25;
-        const [largestAccounts, totalSupplyData] = await Promise.all([
-            retryWithBackoff(() => solanaConnection.getTokenLargestAccounts(pk)),
-            retryWithBackoff(() => solanaConnection.getTokenSupply(pk))
-        ]);
         const topHolderAmount = parseFloat(largestAccounts.value[0]?.uiAmountString || '0');
         const totalSupply = parseFloat(totalSupplyData.value.uiAmountString || '1');
         const concentration = totalSupply > 0 ? (topHolderAmount / totalSupply) * 100 : 100;
         report.checks.isConcentrationLow = concentration <= MAX_HOLDER_CONCENTRATION_PERCENT;
         report.topHolderPercentage = concentration.toFixed(2);
         if (report.checks.isConcentrationLow) score += 25;
-        const sigs = await retryWithBackoff(() => solanaConnection.getSignaturesForAddress(pk, { limit: 1 }));
         const creationTx = await retryWithBackoff(() => solanaConnection.getParsedTransaction(sigs[0].signature, { maxSupportedTransactionVersion: 0 }));
         const isBundled = creationTx.transaction.message.instructions.some(ix => KNOWN_BUNDLER_PROGRAMS.has(ix.programId.toBase58()));
         report.checks.notFromBundler = !isBundled;
         if (report.checks.notFromBundler) score += 10;
-        report.checks.hasSocials = (pair.info?.socials?.length || 0) > 0;
+        report.checks.hasSocials = tokenInfo.extensions && (tokenInfo.extensions.twitter || tokenInfo.extensions.website);
         if (report.checks.hasSocials) score += 10;
         report.vettingScore = score;
         if (score >= 80) report.confidence = 'High';
@@ -423,7 +414,7 @@ async function vetToken(tokenAddress) {
             console.log(`[VETTING] 📉 Score too low. Suppressing alert.`);
         }
     } catch (error) {
-        console.error(`[ERROR] Failed during vetting for ${tokenAddress}:`, error.message);
+        console.error(`[ERROR] Failed during vetting for ${tokenAddress}:`, error.response ? error.response.data : error.message);
     }
 }
 

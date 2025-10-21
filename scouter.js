@@ -1,13 +1,13 @@
 /**
  * Crypto Alpha Finder Backend Engine - Hardened & Tuned
  *
- * This version implements a refined whale discovery strategy and advanced
- * security vetting, including on-chain liquidity lock/burn verification.
- * It is built upon a robust architecture using MongoDB and Redis.
+ * This version implements a robust, multi-step pipeline for whale discovery to
+ * ensure reliable data gathering. It maintains a strategic focus on monitoring
+ * Pump.fun for real-time alpha.
  * This is the complete, unabridged source code file.
  *
  * Author: Gemini (Refined with User Feedback)
- * Version: 5.1 (Elite Strategy)
+ * Version: 5.3 (Pipeline Strategy)
  */
 
 require('dotenv').config();
@@ -30,14 +30,14 @@ const UPSTASH_REDIS_URL = process.env.UPSTASH_REDIS_URL;
 const DEX_SCREENER_API_URL = 'https://api.dexscreener.com/latest/dex';
 const PUMP_PORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 
-// --- STRATEGY & VETTING TUNING (Version 5.1) ---
-const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
-const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60; // 3 days
-const MIN_LIQUIDITY_USD = 50000;
-const MIN_PRICE_CHANGE_H6 = 500; // UPGRADED: Now 500% (6x) gain in 6 hours
-const MIN_VOLUME_H6_USD = 100000; // NEW: Must have at least $100k volume in 6 hours
+// --- STRATEGY & VETTING TUNING (Version 5.3 - Pipeline) ---
+const WHALE_DISCOVERY_INTERVAL = 7 * 24 * 60 * 60 * 1000;
+const MIN_HOLD_DURATION_SECONDS = 3 * 24 * 60 * 60;
+const MIN_LIQUIDITY_USD = 25000; // Lowered slightly to catch more rising stars
+const MIN_PRICE_CHANGE_H6 = 500; // 500% (6x) gain in 6 hours
+const MIN_VOLUME_H6_USD = 50000; // $50k volume in 6 hours
 const MAX_TOKEN_AGE_DAYS = 14;
-const MIN_TOKEN_AGE_DAYS = 3;  // Widen the net for age
+const MIN_TOKEN_AGE_DAYS = 3;
 const MIN_CORRELATED_SUCCESSES = 2;
 const ALPHA_WHALE_COUNT = 50;
 const MULTI_WHALE_CONFIRMATION_COUNT = 2;
@@ -129,7 +129,7 @@ async function checkLiquidityLock(pairAddress) {
 //                                  MAIN APPLICATION LOGIC
 // ==========================================================================================
 async function main() {
-    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.1 (Elite Strategy) 🚀");
+    console.log("🚀 Initializing Hardened Alpha Finder Engine v5.3 (Pipeline Strategy) 🚀");
     await connectToServices();
     await runWhaleDiscoveryCycle();
     setInterval(runWhaleDiscoveryCycle, WHALE_DISCOVERY_INTERVAL);
@@ -235,28 +235,65 @@ async function runWhaleDiscoveryCycle() {
     console.log("[PHASE 1] Whale discovery cycle finished.");
 }
 
+// UPGRADED: Switched to a robust, multi-step pipeline strategy
 async function findSuccessfulTokens() {
+    console.log('[PHASE 1] Starting new token discovery pipeline...');
     try {
-        const { data } = await axios.get(`${DEX_SCREENER_API_URL}/search?q=SOL`);
-        if (!data.pairs || data.pairs.length === 0) return [];
+        // STEP 1: Get a broad list of new pairs on Solana.
+        const { data: newPairsData } = await axios.get(`${DEX_SCREENER_API_URL}/dex/pairs/solana/new`);
+        if (!newPairsData.pairs || newPairsData.pairs.length === 0) {
+            console.log(`[PHASE 1] Step 1/4: DexScreener 'new pairs' endpoint returned no data.`);
+            return [];
+        }
+        console.log(`[PHASE 1] Step 1/4: Fetched ${newPairsData.pairs.length} recent pairs from DexScreener.`);
 
+        // STEP 2: Pre-filter by age.
         const now = Date.now();
         const maxAgeTimestamp = now - (MIN_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
         const minAgeTimestamp = now - (MAX_TOKEN_AGE_DAYS * 24 * 60 * 60 * 1000);
-
-        console.log(`[PHASE 1] Searching for successful tokens created between ${new Date(minAgeTimestamp).toLocaleDateString()} and ${new Date(maxAgeTimestamp).toLocaleDateString()}`);
-
-        const candidates = data.pairs.filter(p =>
-            p.liquidity?.usd > MIN_LIQUIDITY_USD &&
-            p.priceChange?.h6 > MIN_PRICE_CHANGE_H6 && // UPGRADED: Using 500% (6x) h6 price change
-            p.volume?.h6 > MIN_VOLUME_H6_USD && // NEW: Using $100k h6 volume
+        
+        const ageFilteredPairs = newPairsData.pairs.filter(p =>
             p.pairCreatedAt > minAgeTimestamp && p.pairCreatedAt < maxAgeTimestamp
         );
-        
-        console.log(`[PHASE 1] Found ${candidates.length} potential high-quality candidates matching the elite criteria.`);
-        return candidates;
+
+        if (ageFilteredPairs.length === 0) {
+            console.log(`[PHASE 1] Step 2/4: No pairs found within the ${MIN_TOKEN_AGE_DAYS}-${MAX_TOKEN_AGE_DAYS} day age window.`);
+            return [];
+        }
+        console.log(`[PHASE 1] Step 2/4: ${ageFilteredPairs.length} pairs match our age criteria.`);
+
+        // STEP 3: Batch query for detailed stats on our potential candidates.
+        const pairAddresses = ageFilteredPairs.map(p => p.pairAddress);
+        const detailedPairs = [];
+        for (let i = 0; i < pairAddresses.length; i += 30) {
+            const batch = pairAddresses.slice(i, i + 30);
+            try {
+                const { data: batchDetails } = await axios.get(`${DEX_SCREENER_API_URL}/dex/pairs/solana/${batch.join(',')}`);
+                if (batchDetails.pairs) {
+                    detailedPairs.push(...batchDetails.pairs);
+                }
+            } catch (batchError) {
+                 // It's common for some pairs in a batch to become invalid, so we log a warning but continue
+                 if (batchError.response && batchError.response.status === 404) {
+                    console.warn(`[PHASE 1] A batch query contained invalid pairs, which is normal. Continuing...`);
+                } else {
+                    throw batchError; // Re-throw if it's a more serious error
+                }
+            }
+        }
+        console.log(`[PHASE 1] Step 3/4: Fetched detailed stats for ${detailedPairs.length} pairs.`);
+
+        // STEP 4: Apply our final, strict liquidity, volume, and momentum filters.
+        const successfulTokens = detailedPairs.filter(p =>
+            p.liquidity?.usd > MIN_LIQUIDITY_USD &&
+            p.priceChange?.h6 > MIN_PRICE_CHANGE_H6 &&
+            p.volume?.h6 > MIN_VOLUME_H6_USD
+        );
+
+        console.log(`[PHASE 1] Step 4/4: Found ${successfulTokens.length} high-quality candidates matching the elite criteria.`);
+        return successfulTokens;
     } catch (error) {
-        console.error("[ERROR] Failed to fetch successful tokens:", error.message);
+        console.error("[ERROR] Failed to fetch successful tokens during pipeline:", error.message);
         return [];
     }
 }
@@ -279,7 +316,9 @@ async function findAndFilterEarlyBuyers(tokenMintAddress) {
                 
                 const { source, destination } = ix.parsed.info;
                 if (!buyerTimestamps.has(destination)) buyerTimestamps.set(destination, { firstReceiveTime: tx.blockTime, firstSendTime: null });
-                const sourceEntry = buyer_timestamps.get(source);
+                
+                // BUG FIX: Corrected variable name from buyer_timestamps to buyerTimestamps
+                const sourceEntry = buyerTimestamps.get(source);
                 if (sourceEntry && !sourceEntry.firstSendTime) sourceEntry.firstSendTime = tx.blockTime;
             }
         }
